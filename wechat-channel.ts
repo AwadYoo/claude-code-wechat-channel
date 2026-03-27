@@ -166,8 +166,8 @@ async function downloadAndDecryptMedia(
 // ── CDN media upload (for sending images / files) ────────────────────────────
 
 interface UploadUrlResp {
-  upload_url?: string;
-  media_id?: string;
+  upload_param?: string;
+  thumb_upload_param?: string;
   ret?: number;
 }
 
@@ -175,18 +175,25 @@ async function getUploadUrl(
   baseUrl: string,
   token: string,
   toUserId: string,
-  contextToken: string,
+  filekey: string,
   mediaType: number,
-  contentLength: number,
+  rawsize: number,
+  rawfilemd5: string,
+  filesize: number,
+  aeskeyHex: string,
 ): Promise<UploadUrlResp> {
   const raw = await apiFetch({
     baseUrl,
     endpoint: "ilink/bot/getuploadurl",
     body: JSON.stringify({
-      to_user_id: toUserId,
-      context_token: contextToken,
+      filekey,
       media_type: mediaType,
-      content_length: contentLength,
+      to_user_id: toUserId,
+      rawsize,
+      rawfilemd5,
+      filesize,
+      no_need_thumb: true,
+      aeskey: aeskeyHex,
       base_info: { channel_version: CHANNEL_VERSION },
     }),
     token,
@@ -196,16 +203,26 @@ async function getUploadUrl(
 }
 
 async function uploadToCdn(
-  uploadUrl: string,
-  encryptedData: Buffer,
-): Promise<void> {
-  const res = await fetch(uploadUrl, {
-    method: "PUT",
-    body: encryptedData,
-    headers: { "Content-Length": String(encryptedData.length) },
+  uploadParam: string,
+  filekey: string,
+  plaintext: Buffer,
+  aesKey: Buffer,
+): Promise<string> {
+  const ciphertext = encryptAesEcb(plaintext, aesKey);
+  const cdnUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
+  const res = await fetch(cdnUrl, {
+    method: "POST",
+    body: ciphertext,
+    headers: { "Content-Type": "application/octet-stream" },
     signal: AbortSignal.timeout(60_000),
   });
-  if (!res.ok) throw new Error(`CDN upload failed: ${res.status}`);
+  if (!res.ok) {
+    const errMsg = res.headers.get("x-error-message") ?? `status ${res.status}`;
+    throw new Error(`CDN upload failed: ${errMsg}`);
+  }
+  const downloadParam = res.headers.get("x-encrypted-param");
+  if (!downloadParam) throw new Error("CDN upload response missing x-encrypted-param header");
+  return downloadParam;
 }
 
 // ── Typing indicator ──────────────────────────────────────────────────────────
@@ -408,6 +425,7 @@ const MSG_STATE_FINISH = 2;
 
 const MSG_ITEM_TEXT = 1;
 const MSG_ITEM_IMAGE = 2;
+const MSG_UPLOAD_IMAGE = 1; // UploadMediaType: 1=IMAGE, 2=VIDEO, 3=FILE
 const MSG_ITEM_VOICE = 3;
 const MSG_ITEM_FILE = 4;
 const MSG_ITEM_VIDEO = 5;
@@ -657,23 +675,30 @@ async function sendImageMessage(
   imageBuffer: Buffer,
   contextToken: string,
 ): Promise<void> {
-  // Generate a random AES-128 key (16 bytes)
   const aesKey = crypto.randomBytes(16);
-  const encrypted = encryptAesEcb(imageBuffer, aesKey);
+  const filekey = crypto.randomBytes(16).toString("hex");
+  const rawsize = imageBuffer.length;
+  const rawfilemd5 = crypto.createHash("md5").update(imageBuffer).digest("hex");
+  // AES-128-ECB padded size
+  const filesize = Math.ceil(rawsize / 16) * 16;
+  const aeskeyHex = aesKey.toString("hex");
 
-  // Get pre-signed CDN upload URL
+  // Get CDN upload param
   const uploadResp = await getUploadUrl(
-    baseUrl, token, to, contextToken,
-    MSG_ITEM_IMAGE, encrypted.length,
+    baseUrl, token, to,
+    filekey, MSG_UPLOAD_IMAGE,
+    rawsize, rawfilemd5, filesize, aeskeyHex,
   );
-  if (!uploadResp.upload_url || !uploadResp.media_id) {
+  if (!uploadResp.upload_param) {
     throw new Error(`getuploadurl failed: ${JSON.stringify(uploadResp)}`);
   }
 
-  // Upload encrypted image to CDN
-  await uploadToCdn(uploadResp.upload_url, encrypted);
+  // Upload to CDN, get download param from response header
+  const downloadParam = await uploadToCdn(
+    uploadResp.upload_param, filekey, imageBuffer, aesKey,
+  );
 
-  // Send message referencing the uploaded media
+  // Send image message with CDN reference
   await apiFetch({
     baseUrl,
     endpoint: "ilink/bot/sendmessage",
@@ -687,8 +712,12 @@ async function sendImageMessage(
         item_list: [{
           type: MSG_ITEM_IMAGE,
           image_item: {
-            media_id: uploadResp.media_id,
-            aes_key: aesKey.toString("base64"),
+            media: {
+              encrypt_query_param: downloadParam,
+              aes_key: Buffer.from(aeskeyHex).toString("base64"),
+              encrypt_type: 1,
+            },
+            mid_size: filesize,
           },
         }],
         context_token: contextToken,
@@ -885,17 +914,22 @@ async function startPolling(account: AccountData): Promise<never> {
       }
 
       for (const msg of resp.msgs ?? []) {
+        // Log raw message for debugging (truncated context_token)
+        const debugMsg = { ...msg, context_token: msg.context_token ? msg.context_token.slice(0, 20) + "…" : undefined };
+        log(`RAW msg: ${JSON.stringify(debugMsg)}`);
+
         if (msg.message_type !== MSG_TYPE_USER) continue;
 
         const extracted = extractContent(msg);
         if (!extracted) continue;
 
-        const senderId = msg.from_user_id ?? "unknown";
-        const groupId = msg.group_id;
+        // Use || (not ??) so empty strings also fall through to the default
+        const senderId = msg.from_user_id || msg.to_user_id || "unknown";
+        const groupId = msg.group_id || undefined;
         const isGroup = Boolean(groupId);
 
         // Cache context token: group messages key by group_id, DMs by sender_id
-        const contextKey = groupId ?? senderId;
+        const contextKey = groupId || senderId;
         if (msg.context_token) {
           cacheContextToken(contextKey, msg.context_token);
           // In group chats also cache by sender_id so Claude can refer back
