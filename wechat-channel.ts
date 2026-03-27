@@ -15,6 +15,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -138,8 +139,7 @@ async function apiFetch(params: {
 
 // ── AES-128-ECB crypto (for CDN media) ───────────────────────────────────────
 
-function decryptAesEcb(data: Buffer, keyBase64: string): Buffer {
-  const key = Buffer.from(keyBase64, "base64");
+function decryptAesEcb(data: Buffer, key: Buffer): Buffer {
   const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
   decipher.setAutoPadding(true);
   return Buffer.concat([decipher.update(data), decipher.final()]);
@@ -151,6 +151,21 @@ function encryptAesEcb(data: Buffer, key: Buffer): Buffer {
   return Buffer.concat([cipher.update(data), cipher.final()]);
 }
 
+/**
+ * Parse an aes_key field (from CDNMedia) into a raw 16-byte Buffer.
+ * Two encodings seen in the wild:
+ *   - base64(raw 16 bytes)              → standard image media.aes_key
+ *   - base64(32-char hex string)        → file/voice/video media.aes_key
+ */
+function parseAesKey(aesKeyBase64: string): Buffer {
+  const decoded = Buffer.from(aesKeyBase64, "base64");
+  if (decoded.length === 16) return decoded;
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString("ascii"))) {
+    return Buffer.from(decoded.toString("ascii"), "hex");
+  }
+  throw new Error(`Invalid aes_key: decoded to ${decoded.length} bytes (expected 16 or 32-char hex)`);
+}
+
 // ── CDN media download + decrypt ─────────────────────────────────────────────
 
 async function downloadAndDecryptMedia(
@@ -160,7 +175,62 @@ async function downloadAndDecryptMedia(
   const res = await fetch(cdnUrl, { signal: AbortSignal.timeout(30_000) });
   if (!res.ok) throw new Error(`CDN download failed: ${res.status}`);
   const encrypted = Buffer.from(await res.arrayBuffer());
-  return decryptAesEcb(encrypted, aesKeyBase64);
+  return decryptAesEcb(encrypted, parseAesKey(aesKeyBase64));
+}
+
+/**
+ * Download and decrypt an inbound media item from a message.
+ * Returns the path to a temp file, or null if media is unavailable.
+ */
+async function downloadInboundMedia(
+  item: MessageItem,
+  ext: string,
+): Promise<string | null> {
+  let encryptQueryParam: string | undefined;
+  let aesKeyBase64: string | undefined;
+
+  if (item.type === MSG_ITEM_IMAGE && item.image_item) {
+    const img = item.image_item;
+    encryptQueryParam = img.media?.encrypt_query_param;
+    if (!encryptQueryParam) return null;
+    // aeskey (hex string from WeChat) takes priority over media.aes_key
+    aesKeyBase64 = img.aeskey
+      ? Buffer.from(img.aeskey, "hex").toString("base64")
+      : img.media?.aes_key;
+  } else if (item.type === MSG_ITEM_FILE && item.file_item) {
+    encryptQueryParam = item.file_item.media?.encrypt_query_param;
+    aesKeyBase64 = item.file_item.media?.aes_key;
+    if (!encryptQueryParam || !aesKeyBase64) return null;
+  } else if (item.type === MSG_ITEM_VIDEO && item.video_item) {
+    encryptQueryParam = item.video_item.media?.encrypt_query_param;
+    aesKeyBase64 = item.video_item.media?.aes_key;
+    if (!encryptQueryParam || !aesKeyBase64) return null;
+  } else {
+    return null;
+  }
+
+  if (!encryptQueryParam) return null;
+
+  const cdnUrl = `${CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+  try {
+    let data: Buffer;
+    if (aesKeyBase64) {
+      data = await downloadAndDecryptMedia(cdnUrl, aesKeyBase64);
+    } else {
+      const res = await fetch(cdnUrl, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`CDN download failed: ${res.status}`);
+      data = Buffer.from(await res.arrayBuffer());
+    }
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `wechat-inbound-${Date.now()}-${crypto.randomBytes(4).toString("hex")}${ext}`,
+    );
+    fs.writeFileSync(tmpPath, data);
+    return tmpPath;
+  } catch (err) {
+    logError(`下载入站媒体失败: ${String(err)}`);
+    return null;
+  }
 }
 
 // ── CDN media upload (for sending images / files) ────────────────────────────
@@ -429,6 +499,8 @@ const MSG_STATE_FINISH = 2;
 const MSG_ITEM_TEXT = 1;
 const MSG_ITEM_IMAGE = 2;
 const MSG_UPLOAD_IMAGE = 1; // UploadMediaType: 1=IMAGE, 2=VIDEO, 3=FILE
+const MSG_UPLOAD_VIDEO = 2;
+const MSG_UPLOAD_FILE = 3;
 const MSG_ITEM_VOICE = 3;
 const MSG_ITEM_FILE = 4;
 const MSG_ITEM_VIDEO = 5;
@@ -437,27 +509,39 @@ interface TextItem {
   text?: string;
 }
 
+interface MediaRef {
+  encrypt_query_param?: string;
+  aes_key?: string;         // base64-encoded AES key
+  encrypt_type?: number;
+}
+
 interface ImageItem {
-  aes_key?: string;       // base64, AES-128-ECB key
+  aeskey?: string;          // hex string (legacy WeChat format, takes priority)
+  aes_key?: string;         // base64 (legacy)
   cdn_url?: string;
   width?: number;
   height?: number;
   media_id?: string;
+  mid_size?: number;        // ciphertext size (outbound)
+  media?: MediaRef;         // new format
 }
 
 interface VoiceItem {
-  text?: string;          // server-side speech-to-text transcript
+  text?: string;            // server-side speech-to-text transcript
   aes_key?: string;
   cdn_url?: string;
   duration_ms?: number;
+  media?: MediaRef;
 }
 
 interface FileItem {
   file_name?: string;
   file_size?: number;
+  len?: string;             // plaintext size as string (outbound)
   aes_key?: string;
   cdn_url?: string;
   media_id?: string;
+  media?: MediaRef;
 }
 
 interface VideoItem {
@@ -466,6 +550,8 @@ interface VideoItem {
   duration_ms?: number;
   thumb_cdn_url?: string;
   media_id?: string;
+  video_size?: number;      // ciphertext size (outbound)
+  media?: MediaRef;
 }
 
 interface RefMessage {
@@ -511,6 +597,7 @@ type ExtractedContent = {
   text: string;
   msgType: "text" | "voice" | "image" | "file" | "video" | "unknown";
   mediaItem?: ImageItem | FileItem | VideoItem;
+  rawItem?: MessageItem;  // kept for inbound media download
 };
 
 function extractContent(msg: WeixinMessage): ExtractedContent | null {
@@ -545,6 +632,7 @@ function extractContent(msg: WeixinMessage): ExtractedContent | null {
           text: `[图片${dims}]`,
           msgType: "image",
           mediaItem: img,
+          rawItem: item,
         };
       }
 
@@ -558,6 +646,7 @@ function extractContent(msg: WeixinMessage): ExtractedContent | null {
           text: `[文件${name}${size}]`,
           msgType: "file",
           mediaItem: f,
+          rawItem: item,
         };
       }
 
@@ -570,6 +659,7 @@ function extractContent(msg: WeixinMessage): ExtractedContent | null {
           text: `[视频${dur}]`,
           msgType: "video",
           mediaItem: v,
+          rawItem: item,
         };
       }
 
@@ -732,6 +822,122 @@ async function sendImageMessage(
   });
 }
 
+async function sendFileMessage(
+  baseUrl: string,
+  token: string,
+  to: string,
+  fileBuffer: Buffer,
+  fileName: string,
+  contextToken: string,
+): Promise<void> {
+  const aesKey = crypto.randomBytes(16);
+  const filekey = crypto.randomBytes(16).toString("hex");
+  const rawsize = fileBuffer.length;
+  const rawfilemd5 = crypto.createHash("md5").update(fileBuffer).digest("hex");
+  const filesize = Math.ceil((rawsize + 1) / 16) * 16;
+  const aeskeyHex = aesKey.toString("hex");
+
+  const uploadResp = await getUploadUrl(
+    baseUrl, token, to,
+    filekey, MSG_UPLOAD_FILE,
+    rawsize, rawfilemd5, filesize, aeskeyHex,
+  );
+  if (!uploadResp.upload_param) {
+    throw new Error(`getuploadurl failed: ${JSON.stringify(uploadResp)}`);
+  }
+
+  const downloadParam = await uploadToCdn(
+    uploadResp.upload_param, filekey, fileBuffer, aesKey,
+  );
+
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: to,
+        client_id: generateClientId(),
+        message_type: MSG_TYPE_BOT,
+        message_state: MSG_STATE_FINISH,
+        item_list: [{
+          type: MSG_ITEM_FILE,
+          file_item: {
+            media: {
+              encrypt_query_param: downloadParam,
+              aes_key: Buffer.from(aeskeyHex).toString("base64"),
+              encrypt_type: 1,
+            },
+            file_name: fileName,
+            len: String(rawsize),
+          },
+        }],
+        context_token: contextToken,
+      },
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token,
+    timeoutMs: 30_000,
+  });
+}
+
+async function sendVideoMessage(
+  baseUrl: string,
+  token: string,
+  to: string,
+  videoBuffer: Buffer,
+  contextToken: string,
+): Promise<void> {
+  const aesKey = crypto.randomBytes(16);
+  const filekey = crypto.randomBytes(16).toString("hex");
+  const rawsize = videoBuffer.length;
+  const rawfilemd5 = crypto.createHash("md5").update(videoBuffer).digest("hex");
+  const filesize = Math.ceil((rawsize + 1) / 16) * 16;
+  const aeskeyHex = aesKey.toString("hex");
+
+  const uploadResp = await getUploadUrl(
+    baseUrl, token, to,
+    filekey, MSG_UPLOAD_VIDEO,
+    rawsize, rawfilemd5, filesize, aeskeyHex,
+  );
+  if (!uploadResp.upload_param) {
+    throw new Error(`getuploadurl failed: ${JSON.stringify(uploadResp)}`);
+  }
+
+  const downloadParam = await uploadToCdn(
+    uploadResp.upload_param, filekey, videoBuffer, aesKey,
+  );
+
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: to,
+        client_id: generateClientId(),
+        message_type: MSG_TYPE_BOT,
+        message_state: MSG_STATE_FINISH,
+        item_list: [{
+          type: MSG_ITEM_VIDEO,
+          video_item: {
+            media: {
+              encrypt_query_param: downloadParam,
+              aes_key: Buffer.from(aeskeyHex).toString("base64"),
+              encrypt_type: 1,
+            },
+            video_size: filesize,
+          },
+        }],
+        context_token: contextToken,
+      },
+      base_info: { channel_version: CHANNEL_VERSION },
+    }),
+    token,
+    timeoutMs: 120_000,
+  });
+}
+
 // ── MCP Channel Server ────────────────────────────────────────────────────────
 
 const mcp = new Server(
@@ -751,20 +957,25 @@ const mcp = new Server(
       "  can_reply    — 'true': reply normally; 'false': no session token, tell the user to send another message",
       "  is_group     — 'true' if from a group chat",
       "  group_id     — group ID when is_group=true (use this as the reply target in groups)",
+      "  image_path   — absolute path to downloaded image temp file (present when msg_type=image)",
+      "  file_path    — absolute path to downloaded file temp file (present when msg_type=file)",
+      "  video_path   — absolute path to downloaded video temp file (present when msg_type=video)",
       "",
       "Tools available:",
       "  wechat_reply        — send a plain-text reply (always available)",
       "  wechat_send_image   — send an image file from local disk (provide absolute path)",
+      "  wechat_send_file    — send any file (Word/PDF/Excel/etc.) from local disk",
+      "  wechat_send_video   — send a video file from local disk",
       "",
       "Rules:",
       "  - If can_reply=false, do NOT call wechat_reply. Instead output: 'NOTICE: cannot reply, session token missing. User must send one more message.'",
-      "  - Otherwise always use wechat_reply or wechat_send_image — never leave a message unanswered.",
+      "  - Otherwise always use one of the reply tools — never leave a message unanswered.",
       "  - In group chats (is_group=true), pass the group_id as sender_id to reply to the group.",
       "  - Strip all markdown — WeChat renders plain text only.",
       "  - Keep replies concise. WeChat is a chat app.",
       "  - Default language is Chinese unless the user writes in another language.",
       "  - For voice messages the transcript is already in the content — treat it as text.",
-      "  - For image/file/video messages, describe what you see / acknowledge receipt.",
+      "  - When image_path/file_path/video_path is present, use the Read tool to view/analyze the file before replying.",
     ].join("\n"),
   },
 );
@@ -806,6 +1017,46 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           file_path: {
             type: "string",
             description: "Absolute path to the image file on disk (PNG, JPG, etc.)",
+          },
+        },
+        required: ["sender_id", "file_path"],
+      },
+    },
+    {
+      name: "wechat_send_file",
+      description: "Send a local file (Word, PDF, Excel, etc.) to the WeChat user",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          sender_id: {
+            type: "string",
+            description: "Same as wechat_reply sender_id",
+          },
+          file_path: {
+            type: "string",
+            description: "Absolute path to the file on disk",
+          },
+          file_name: {
+            type: "string",
+            description: "File name shown to the recipient (defaults to basename of file_path)",
+          },
+        },
+        required: ["sender_id", "file_path"],
+      },
+    },
+    {
+      name: "wechat_send_video",
+      description: "Send a local video file to the WeChat user",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          sender_id: {
+            type: "string",
+            description: "Same as wechat_reply sender_id",
+          },
+          file_path: {
+            type: "string",
+            description: "Absolute path to the video file on disk (MP4, etc.)",
           },
         },
         required: ["sender_id", "file_path"],
@@ -866,6 +1117,60 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       return { content: [{ type: "text" as const, text: "image sent" }] };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `image send failed: ${String(err)}` }] };
+    }
+  }
+
+  if (req.params.name === "wechat_send_file") {
+    const { sender_id, file_path, file_name } = req.params.arguments as {
+      sender_id: string;
+      file_path: string;
+      file_name?: string;
+    };
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `error: no context_token for ${sender_id}.`,
+        }],
+      };
+    }
+    try {
+      const fileBuffer = fs.readFileSync(file_path);
+      const resolvedName = file_name || path.basename(file_path);
+      await sendFileMessage(
+        activeAccount.baseUrl, activeAccount.token,
+        sender_id, fileBuffer, resolvedName, contextToken,
+      );
+      return { content: [{ type: "text" as const, text: `file sent: ${resolvedName}` }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `file send failed: ${String(err)}` }] };
+    }
+  }
+
+  if (req.params.name === "wechat_send_video") {
+    const { sender_id, file_path } = req.params.arguments as {
+      sender_id: string;
+      file_path: string;
+    };
+    const contextToken = getCachedContextToken(sender_id);
+    if (!contextToken) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `error: no context_token for ${sender_id}.`,
+        }],
+      };
+    }
+    try {
+      const videoBuffer = fs.readFileSync(file_path);
+      await sendVideoMessage(
+        activeAccount.baseUrl, activeAccount.token,
+        sender_id, videoBuffer, contextToken,
+      );
+      return { content: [{ type: "text" as const, text: "video sent" }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `video send failed: ${String(err)}` }] };
     }
   }
 
@@ -963,6 +1268,24 @@ async function startPolling(account: AccountData): Promise<never> {
           meta.is_group = "true";
           meta.group_id = groupId as string;
           meta.from_sender_id = senderId;
+        }
+
+        // Download inbound media (image/file/video) so Claude can read it
+        if (extracted.rawItem) {
+          const ext = extracted.msgType === "image" ? ".jpg"
+            : extracted.msgType === "video" ? ".mp4"
+            : extracted.msgType === "file"
+              ? (path.extname((extracted.mediaItem as FileItem)?.file_name ?? "") || ".bin")
+              : "";
+          if (ext) {
+            const mediaPath = await downloadInboundMedia(extracted.rawItem, ext);
+            if (mediaPath) {
+              if (extracted.msgType === "image") meta.image_path = mediaPath;
+              else if (extracted.msgType === "file") meta.file_path = mediaPath;
+              else if (extracted.msgType === "video") meta.video_path = mediaPath;
+              log(`入站媒体已下载: ${mediaPath}`);
+            }
+          }
         }
 
         await mcp.notification({
