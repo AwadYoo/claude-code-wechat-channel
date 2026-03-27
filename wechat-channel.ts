@@ -237,6 +237,7 @@ async function getTypingTicket(
   token: string,
   toUserId: string,
   contextToken: string,
+  ilinkUserId: string,
 ): Promise<string | null> {
   try {
     const raw = await apiFetch({
@@ -245,6 +246,7 @@ async function getTypingTicket(
       body: JSON.stringify({
         to_user_id: toUserId,
         context_token: contextToken,
+        ilink_user_id: ilinkUserId,
         base_info: { channel_version: CHANNEL_VERSION },
       }),
       token,
@@ -284,9 +286,10 @@ async function showTypingIndicator(
   token: string,
   toUserId: string,
   contextToken: string,
+  ilinkUserId: string,
 ): Promise<void> {
   try {
-    const ticket = await getTypingTicket(baseUrl, token, toUserId, contextToken);
+    const ticket = await getTypingTicket(baseUrl, token, toUserId, contextToken, ilinkUserId);
     if (ticket) {
       await sendTyping(baseUrl, token, toUserId, contextToken, ticket);
     }
@@ -680,7 +683,7 @@ async function sendImageMessage(
   const rawsize = imageBuffer.length;
   const rawfilemd5 = crypto.createHash("md5").update(imageBuffer).digest("hex");
   // AES-128-ECB padded size
-  const filesize = Math.ceil(rawsize / 16) * 16;
+  const filesize = Math.ceil((rawsize + 1) / 16) * 16;
   const aeskeyHex = aesKey.toString("hex");
 
   // Get CDN upload param
@@ -946,7 +949,7 @@ async function startPolling(account: AccountData): Promise<never> {
 
         // Show typing indicator only when we can actually reply
         if (canReply && msg.context_token) {
-          showTypingIndicator(baseUrl, token, senderId, msg.context_token).catch(() => {});
+          showTypingIndicator(baseUrl, token, senderId, msg.context_token, activeAccount!.accountId).catch(() => {});
         }
 
         // Build meta for the <channel> tag
