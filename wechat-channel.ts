@@ -703,6 +703,35 @@ function getCachedContextToken(key: string): string | undefined {
   return contextTokenCache.get(key);
 }
 
+// ── Typing indicator keep-alive ───────────────────────────────────────────────
+// Key: senderId (or groupId). Cleared when a reply tool is called.
+
+const typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
+const TYPING_REFRESH_MS = 4_000;
+
+function startTypingKeepAlive(
+  baseUrl: string,
+  token: string,
+  senderId: string,
+  contextToken: string,
+  ilinkUserId: string,
+): void {
+  stopTypingKeepAlive(senderId);
+  showTypingIndicator(baseUrl, token, senderId, contextToken, ilinkUserId).catch(() => {});
+  const interval = setInterval(() => {
+    showTypingIndicator(baseUrl, token, senderId, contextToken, ilinkUserId).catch(() => {});
+  }, TYPING_REFRESH_MS);
+  typingIntervals.set(senderId, interval);
+}
+
+function stopTypingKeepAlive(senderId: string): void {
+  const interval = typingIntervals.get(senderId);
+  if (interval !== undefined) {
+    clearInterval(interval);
+    typingIntervals.delete(senderId);
+  }
+}
+
 // ── getUpdates / sendMessage ──────────────────────────────────────────────────
 
 async function getUpdates(
@@ -1088,6 +1117,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     try {
       await sendTextMessage(activeAccount.baseUrl, activeAccount.token, sender_id, text, contextToken);
+      stopTypingKeepAlive(sender_id);
       return { content: [{ type: "text" as const, text: "sent" }] };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `send failed: ${String(err)}` }] };
@@ -1114,6 +1144,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         activeAccount.baseUrl, activeAccount.token,
         sender_id, imageBuffer, contextToken,
       );
+      stopTypingKeepAlive(sender_id);
       return { content: [{ type: "text" as const, text: "image sent" }] };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `image send failed: ${String(err)}` }] };
@@ -1142,6 +1173,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         activeAccount.baseUrl, activeAccount.token,
         sender_id, fileBuffer, resolvedName, contextToken,
       );
+      stopTypingKeepAlive(sender_id);
       return { content: [{ type: "text" as const, text: `file sent: ${resolvedName}` }] };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `file send failed: ${String(err)}` }] };
@@ -1168,6 +1200,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         activeAccount.baseUrl, activeAccount.token,
         sender_id, videoBuffer, contextToken,
       );
+      stopTypingKeepAlive(sender_id);
       return { content: [{ type: "text" as const, text: "video sent" }] };
     } catch (err) {
       return { content: [{ type: "text" as const, text: `video send failed: ${String(err)}` }] };
@@ -1252,9 +1285,9 @@ async function startPolling(account: AccountData): Promise<never> {
         const senderShort = senderId.split("@")[0] || senderId;
         log(`收到${isGroup ? "群" : "私"}消息 [${extracted.msgType}]: from=${senderShort}${isGroup ? ` group=${groupId}` : ""} can_reply=${canReply} "${extracted.text.slice(0, 60)}"`);
 
-        // Show typing indicator only when we can actually reply
+        // Start typing keep-alive: refreshes every 4s until a reply tool is called
         if (canReply && msg.context_token) {
-          showTypingIndicator(baseUrl, token, senderId, msg.context_token, activeAccount!.accountId).catch(() => {});
+          startTypingKeepAlive(baseUrl, token, senderId, msg.context_token, activeAccount!.accountId);
         }
 
         // Build meta for the <channel> tag
